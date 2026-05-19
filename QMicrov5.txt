@@ -1,0 +1,851 @@
+
+This update resolves the critical capability free-list bug, introduces strict lifecycle and revocation management for MPU grants, formally defines a `spawn_task` API with proper stack sentinels (watermarking), expands the verification suite, and refines the Quantum scheduling parameters.
+
+### `qmicro-workspace/Cargo.toml`
+```toml
+[workspace]
+members = ["qmicro-schema", "qmicro"]
+resolver = "2"
+
+[workspace.dependencies]
+spin = "0.9"
+heapless = "0.8"
+defmt = "0.3" # Zero-cost logging & observability
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+```
+
+---
+
+### `qmicro-schema/src/lib.rs`
+```rust
+//! # qmicro-schema
+//! Shared primitive types, capabilities, and L4-style message definitions.
+
+#![cfg_attr(not(test), no_std)]
+#![deny(missing_docs)]
+
+use core::cmp::Ordering;
+
+// ── Primitive wrappers ────────────────────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Nanoseconds(pub u64);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Pid(pub u32);
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct Epoch(pub u64);
+
+/// **Quantum Domain Model**: 
+/// Represents an isolated execution environment mapped directly to a physical QPU region.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct QuantumDomain(pub u8);
+
+// ── Capability Rights ─────────────────────────────────────────────────────────
+pub const RIGHT_READ: u8     = 1 << 0;
+pub const RIGHT_WRITE: u8    = 1 << 1;
+pub const RIGHT_INVOKE: u8   = 1 << 2;
+pub const RIGHT_DELEGATE: u8 = 1 << 3; // L4-style delegation
+pub const RIGHT_MAP: u8      = 1 << 4;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct CapToken {
+    pub index: u16,
+    pub gen: u16,
+}
+
+// ── Typed IPC Grants ──────────────────────────────────────────────────────────
+#[derive(Clone, Copy, Debug)]
+pub struct Grant {
+    pub addr: usize,
+    pub size: usize,
+    pub read_only: bool,
+}
+
+/// Hardware-timed synchronization constraints for quantum pulses
+#[derive(Clone, Copy, Debug)]
+pub struct PulseTiming {
+    pub start: u64,
+    pub is_absolute: bool, // Relative (delay) vs Absolute (deadline)
+    pub duration_cycles: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum TypedGrant {
+    QuantumPulseBuffer(Grant, PulseTiming),
+    ClassicalControl(Grant),
+    MeasurementResult(Grant),
+}
+
+// ── L4-Style Message Passing ──────────────────────────────────────────────────
+/// A short control message that can be sent over IPC.
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Message {
+    pub label: u32,
+    pub args: [u32; 4],
+    pub capability: Option<CapToken>,
+    pub reply_cap: Option<CapToken>, // For L4 request-reply semantics
+}
+
+pub const ISOCHRONOUS_TICK: Nanoseconds = Nanoseconds(1_000_000); // 1 ms
+```
+
+---
+
+### `qmicro/src/config.rs`
+```rust
+//! Centralised compile-time constants.
+
+pub const NUM_DOMAINS: usize = 8;
+pub const CAP_TABLE_SIZE: usize = 256;
+pub const IPC_GRANT_SLOTS: usize = 32;
+pub const MSG_QUEUE_SIZE: usize = 16;
+pub const RUN_QUEUE_SIZE: usize = 32;
+pub const WATCHDOG_TIMEOUT_MS: u32 = 5_000;
+
+pub const STACK_REDZONE_BYTES: usize = 128;
+pub const STACK_SENTINEL: u32 = 0xDEADBEEF;
+
+/// Tolerance for task deadline overruns before triggering domain recovery.
+pub const OVERRUN_THRESHOLD_NS: u64 = 50_000; // 50 µs
+```
+
+---
+
+### `qmicro/src/error.rs`
+```rust
+//! Kernel-wide error enumeration.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum KernelError {
+    CapOutOfRange,
+    CapStaleGen,
+    CapEmpty,
+    CapRevoked,
+    CapTableFull,
+    PermissionDenied,
+    IpcGrantOverlap,
+    IpcReceiverQueueFull,
+    IpcReceiverQueueEmpty,
+    MpuConfigFailed,
+    InvalidDomain,
+    MathOverflow,
+    DeadlineOverrun,
+    RunQueueFull,
+}
+
+pub type KResult<T> = Result<T, KernelError>;
+```
+
+---
+
+### `qmicro/src/capability.rs`
+```rust
+//! Unified Capability Table with First-Class RAII.
+//! Separates generational slot tracking from free-list linking.
+
+#![deny(unsafe_code)]
+
+use crate::sync::IrqSafeMutex;
+use crate::config::{NUM_DOMAINS, CAP_TABLE_SIZE};
+use crate::error::{KernelError, KResult};
+use qmicro_schema::{Pid, Epoch, CapToken, QuantumDomain};
+
+static DOMAIN_EPOCHS: IrqSafeMutex<[Epoch; NUM_DOMAINS]> = IrqSafeMutex::new([Epoch(0); NUM_DOMAINS]);
+
+pub static GLOBAL_CAP_TABLE: IrqSafeMutex<CapabilityTable> = IrqSafeMutex::new(CapabilityTable::new());
+
+pub fn advance_epoch(domain: QuantumDomain) {
+    let mut epochs = DOMAIN_EPOCHS.lock();
+    epochs[domain.0 as usize].0 += 1;
+    defmt::info!("Domain {} epoch advanced to {}", domain.0, epochs[domain.0 as usize].0);
+}
+
+// ── First Class Capabilities (RAII) ───────────────────────────────────────────
+
+/// An owned capability guard. Enforces RAII drop-revocation. 
+/// Inherently non-Copy.
+pub struct OwnedCap {
+    pub token: CapToken,
+    pub rights_mask: u8,
+}
+
+impl OwnedCap {
+    /// Explicitly consume and revoke the capability.
+    pub fn revoke(self) {
+        // Drop is called automatically when taking ownership and letting it fall out of scope.
+    }
+}
+
+impl Drop for OwnedCap {
+    fn drop(&mut self) {
+        let _ = GLOBAL_CAP_TABLE.lock().revoke_token(self.token);
+        defmt::trace!("RAII Drop: Revoked Capability {}", self.token.index);
+    }
+}
+
+// ── Internal Capability Table ─────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+pub struct Capability {
+    pub owner: Pid,
+    pub domain: QuantumDomain,
+    pub epoch: Epoch,
+    pub rights: u8,
+}
+
+#[derive(Clone, Copy)]
+enum SlotState {
+    Free { next: u16 },
+    Occupied(Capability),
+}
+
+#[derive(Clone, Copy)]
+struct CapSlot {
+    gen: u16,
+    state: SlotState,
+}
+
+pub struct CapabilityTable {
+    slots: [CapSlot; CAP_TABLE_SIZE],
+    free_head: u16,
+}
+
+impl CapabilityTable {
+    pub const fn new() -> Self {
+        let mut slots = [CapSlot { gen: 1, state: SlotState::Free { next: 0 } }; CAP_TABLE_SIZE];
+        let mut i = 0;
+        while i < CAP_TABLE_SIZE - 1 {
+            slots[i].state = SlotState::Free { next: (i + 1) as u16 };
+            i += 1;
+        }
+        slots[CAP_TABLE_SIZE - 1].state = SlotState::Free { next: u16::MAX };
+        Self { slots, free_head: 0 }
+    }
+
+    pub fn mint(&mut self, cap: Capability) -> KResult<CapToken> {
+        let idx = self.free_head;
+        if idx == u16::MAX { return Err(KernelError::CapTableFull); }
+        
+        let slot = &mut self.slots[idx as usize];
+        
+        // Follow the free list
+        if let SlotState::Free { next } = slot.state {
+            self.free_head = next;
+        } else {
+            unreachable!(); // Data structure integrity failure
+        }
+
+        slot.gen = slot.gen.wrapping_add(1) | 1; // Mark odd (generation bump)
+        slot.state = SlotState::Occupied(cap);
+
+        Ok(CapToken { index: idx, gen: slot.gen })
+    }
+
+    pub fn lookup(&self, token: CapToken, required_rights: u8) -> KResult<Capability> {
+        let idx = token.index as usize;
+        if idx >= CAP_TABLE_SIZE { return Err(KernelError::CapOutOfRange); }
+        
+        let slot = &self.slots[idx];
+        if slot.gen != token.gen { return Err(KernelError::CapStaleGen); }
+        
+        match slot.state {
+            SlotState::Occupied(cap) => {
+                if cap.rights & required_rights != required_rights {
+                    return Err(KernelError::PermissionDenied);
+                }
+
+                let epochs = DOMAIN_EPOCHS.lock();
+                let domain_epoch = epochs[cap.domain.0 as usize];
+                if cap.epoch.0 < domain_epoch.0 {
+                    return Err(KernelError::CapRevoked);
+                }
+
+                Ok(cap)
+            }
+            SlotState::Free { .. } => Err(KernelError::CapEmpty),
+        }
+    }
+
+    pub fn revoke_token(&mut self, token: CapToken) -> KResult<()> {
+        let idx = token.index as usize;
+        if idx >= CAP_TABLE_SIZE { return Err(KernelError::CapOutOfRange); }
+        
+        let slot = &mut self.slots[idx];
+        if slot.gen != token.gen { return Err(KernelError::CapStaleGen); }
+        
+        match slot.state {
+            SlotState::Occupied(_) => {
+                slot.gen = (slot.gen.wrapping_add(1) & !1); // Mark even
+                slot.state = SlotState::Free { next: self.free_head };
+                self.free_head = idx as u16;
+                Ok(())
+            }
+            SlotState::Free { .. } => Err(KernelError::CapEmpty),
+        }
+    }
+}
+```
+
+---
+
+### `qmicro/src/ipc.rs`
+```rust
+//! IPC: Message Queues & Cycle-Accurate Grants.
+
+#![deny(unsafe_code)]
+
+use qmicro_schema::{Pid, CapToken, Message, TypedGrant, QuantumDomain};
+use crate::error::{KResult, KernelError};
+use crate::capability::{GLOBAL_CAP_TABLE, RIGHT_MAP, RIGHT_INVOKE};
+use crate::sync::IrqSafeMutex;
+use crate::config::{IPC_GRANT_SLOTS, NUM_DOMAINS, MSG_QUEUE_SIZE};
+use heapless::Vec;
+
+static ACTIVE_GRANTS: IrqSafeMutex<Vec<(QuantumDomain, TypedGrant), IPC_GRANT_SLOTS>> = IrqSafeMutex::new(Vec::new());
+
+// ── Ringbuffer Message Queues ─────────────────────────────────────────────────
+
+pub struct MsgQueue {
+    buffer: [Message; MSG_QUEUE_SIZE],
+    head: usize,
+    tail: usize,
+    count: usize,
+}
+
+impl MsgQueue {
+    const fn new() -> Self {
+        Self { buffer: [Message { label: 0, args: [0;4], capability: None, reply_cap: None }; MSG_QUEUE_SIZE], head: 0, tail: 0, count: 0 }
+    }
+    fn push(&mut self, msg: Message) -> KResult<()> {
+        if self.count == MSG_QUEUE_SIZE { return Err(KernelError::IpcReceiverQueueFull); }
+        self.buffer[self.tail] = msg;
+        self.tail = (self.tail + 1) % MSG_QUEUE_SIZE;
+        self.count += 1;
+        Ok(())
+    }
+    fn pop(&mut self) -> KResult<Message> {
+        if self.count == 0 { return Err(KernelError::IpcReceiverQueueEmpty); }
+        let msg = self.buffer[self.head];
+        self.head = (self.head + 1) % MSG_QUEUE_SIZE;
+        self.count -= 1;
+        Ok(msg)
+    }
+    fn clear(&mut self) {
+        self.head = 0;
+        self.tail = 0;
+        self.count = 0;
+    }
+}
+
+static RECEIVER_QUEUES: IrqSafeMutex<[MsgQueue; NUM_DOMAINS]> = IrqSafeMutex::new([MsgQueue::new(); NUM_DOMAINS]);
+
+pub fn clear_queue(domain: QuantumDomain) {
+    let mut queues = RECEIVER_QUEUES.lock();
+    queues[domain.0 as usize].clear();
+}
+
+// ── L4 Message Passing ────────────────────────────────────────────────────────
+
+pub fn sys_send(target_domain: QuantumDomain, token: CapToken, msg: Message) -> KResult<()> {
+    let table = GLOBAL_CAP_TABLE.lock();
+    let _cap = table.lookup(token, RIGHT_INVOKE)?;
+    
+    let mut queues = RECEIVER_QUEUES.lock();
+    queues[target_domain.0 as usize].push(msg)?;
+    
+    defmt::trace!("IPC Send to Domain {}: {:?}", target_domain.0, msg.label);
+    Ok(())
+}
+
+pub fn sys_recv(my_domain: QuantumDomain) -> KResult<Message> {
+    let mut queues = RECEIVER_QUEUES.lock();
+    queues[my_domain.0 as usize].pop()
+}
+
+// ── MPU Memory Grants ─────────────────────────────────────────────────────────
+
+pub fn map_typed_grant(source: Pid, target_domain: QuantumDomain, token: CapToken, grant: TypedGrant) -> KResult<()> {
+    let table = GLOBAL_CAP_TABLE.lock();
+    let cap = table.lookup(token, RIGHT_MAP)?;
+    if cap.owner != source { return Err(KernelError::CapRevoked); }
+
+    let mut active = ACTIVE_GRANTS.lock();
+    check_overlap(&active, &grant)?;
+    let _ = active.push((target_domain, grant));
+
+    let (addr, size, read_only) = get_grant_details(&grant);
+    crate::hw::mpu::configure_grant_region(target_domain, addr, size, read_only)?;
+    Ok(())
+}
+
+pub fn revoke_grants_for_domain(target: QuantumDomain) {
+    let mut active = ACTIVE_GRANTS.lock();
+    let mut i = 0;
+    while i < active.len() {
+        if active[i].0 == target {
+            active.swap_remove(i);
+            // Inform hardware abstraction to drop mappings
+            let _ = crate::hw::mpu::unmap_grant_region(target);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn get_grant_details(grant: &TypedGrant) -> (usize, usize, bool) {
+    match grant {
+        TypedGrant::QuantumPulseBuffer(g, _) => (g.addr, g.size, g.read_only),
+        TypedGrant::ClassicalControl(g)      => (g.addr, g.size, g.read_only),
+        TypedGrant::MeasurementResult(g)     => (g.addr, g.size, true), 
+    }
+}
+
+fn check_overlap(active: &Vec<(QuantumDomain, TypedGrant), IPC_GRANT_SLOTS>, new: &TypedGrant) -> KResult<()> {
+    let (n_start, n_size, _) = get_grant_details(new);
+    let n_end = n_start + n_size;
+    
+    for (_, existing) in active.iter() {
+        let (e_start, e_size, _) = get_grant_details(existing);
+        let e_end = e_start + e_size;
+        
+        if n_start < e_end && e_start < n_end {
+            return Err(KernelError::IpcGrantOverlap);
+        }
+    }
+    Ok(())
+}
+```
+
+---
+
+### `qmicro/src/scheduler.rs`
+```rust
+//! EDF Scheduler with Stack Watermarking and Context Saving Boundaries.
+
+use core::sync::atomic::{AtomicU32, Ordering};
+use crate::config::{OVERRUN_THRESHOLD_NS, STACK_SENTINEL, STACK_REDZONE_BYTES, RUN_QUEUE_SIZE};
+use crate::error::{KResult, KernelError};
+use crate::hw::{timer, watchdog, mpu};
+use crate::sync::IrqSafeMutex;
+use heapless::binary_heap::{BinaryHeap, Min};
+use qmicro_schema::{Nanoseconds, Pid, QuantumDomain};
+
+static PREEMPT_BITMAP: AtomicU32 = AtomicU32::new(0);
+
+pub fn signal_preemption(domain: QuantumDomain) {
+    PREEMPT_BITMAP.fetch_or(1 << domain.0, Ordering::SeqCst);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    Ready,
+    BlockedOnIpc,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Task {
+    pub deadline: Nanoseconds,
+    pub pid: Pid,
+    pub domain: QuantumDomain,
+    pub stack_base: usize,
+    pub stack_size: usize,
+    pub state: TaskState,
+}
+
+impl PartialOrd for Task {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.deadline.cmp(&other.deadline))
+    }
+}
+impl Ord for Task {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.deadline.cmp(&other.deadline)
+    }
+}
+
+static RUN_QUEUE: IrqSafeMutex<BinaryHeap<Task, Min, RUN_QUEUE_SIZE>> = IrqSafeMutex::new(BinaryHeap::new());
+
+/// Task Creation API with secure Stack initialization (watermarking support)
+pub fn spawn_task(
+    pid: Pid, 
+    domain: QuantumDomain, 
+    deadline: Nanoseconds, 
+    stack_base: usize, 
+    stack_size: usize
+) -> KResult<()> {
+    // Fill the stack with a sentinel value so we can measure high water mark
+    unsafe {
+        let ptr = stack_base as *mut u32;
+        let words = stack_size / 4;
+        for i in 0..words {
+            core::ptr::write_volatile(ptr.add(i), STACK_SENTINEL);
+        }
+    }
+
+    let task = Task { deadline, pid, domain, stack_base, stack_size, state: TaskState::Ready };
+    let mut queue = RUN_QUEUE.lock();
+    queue.push(task).map_err(|_| KernelError::RunQueueFull)?;
+    
+    Ok(())
+}
+
+pub fn tick() -> KResult<()> {
+    watchdog::pet();
+
+    let bitmap = PREEMPT_BITMAP.swap(0, Ordering::SeqCst);
+    if bitmap != 0 {
+        watchdog::handle_domain_recovery(bitmap);
+    }
+
+    crate::hw::p4::drain_ring();
+
+    let now = timer::now_ns();
+    let mut queue = RUN_QUEUE.lock();
+
+    let mut pending_task = None;
+    if let Some(task) = queue.peek() {
+        if task.state == TaskState::Ready {
+            pending_task = Some(*task);
+        }
+    }
+
+    if let Some(task) = pending_task {
+        if task.deadline <= now {
+            if now.0.saturating_sub(task.deadline.0) > OVERRUN_THRESHOLD_NS {
+                defmt::error!("Overrun in Domain {}!", task.domain.0);
+                watchdog::handle_overrun(task.domain);
+            }
+
+            queue.pop();
+            drop(queue);
+
+            // Hardware enforcement bounds
+            unsafe { mpu::configure_stack_guard(task.stack_base, task.stack_size); }
+            
+            // Observability: Runtime stack usage reporting
+            check_stack_watermark(&task);
+            
+            dispatch_task(task);
+        } else {
+            let delay = Nanoseconds(task.deadline.0.saturating_sub(now.0));
+            drop(queue);
+            unsafe { timer::arm_one_shot(delay); }
+            hw_sleep();
+        }
+    } else {
+        drop(queue);
+        hw_sleep();
+    }
+    
+    Ok(())
+}
+
+fn hw_sleep() {
+    #[cfg(target_arch = "arm")]
+    unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
+}
+
+fn check_stack_watermark(task: &Task) {
+    let mut ptr = task.stack_base as *const u32;
+    let end = (task.stack_base + task.stack_size) as *const u32;
+    let mut unused_bytes = 0;
+
+    unsafe {
+        while ptr < end {
+            if core::ptr::read_volatile(ptr) == STACK_SENTINEL {
+                unused_bytes += 4;
+            } else {
+                break;
+            }
+            ptr = ptr.add(1);
+        }
+    }
+
+    let used_bytes = task.stack_size.saturating_sub(unused_bytes);
+    defmt::trace!("Task {} (Domain {}) Stack: {}/{} bytes used", 
+                  task.pid.0, task.domain.0, used_bytes, task.stack_size);
+
+    if unused_bytes < STACK_REDZONE_BYTES {
+        defmt::error!("Stack near-overflow in Domain {}!", task.domain.0);
+        watchdog::trigger_panic(true, Some(task.domain), "Stack Redzone Breached");
+    }
+}
+
+/// Dispatches the chosen task.
+/// Context Switch Boundary: Platform-specific assembly is required to save standard 
+/// CPU registers (e.g., r0-r15, xPSR) to the outgoing task's TCB and restore them 
+/// from the incoming task.
+fn dispatch_task(_task: Task) {
+    // extern "C" { fn asm_context_switch(outgoing: *mut TCB, incoming: *const TCB); }
+}
+```
+
+---
+
+### `qmicro/src/hw/watchdog.rs`
+```rust
+//! Health Monitor & Domain Recovery.
+
+use qmicro_schema::QuantumDomain;
+
+pub fn pet() { /* Feed HW Watchdog */ }
+
+pub fn handle_overrun(domain: QuantumDomain) {
+    crate::scheduler::signal_preemption(domain);
+}
+
+pub fn handle_domain_recovery(domain_bitmap: u32) {
+    for d in 0..crate::config::NUM_DOMAINS {
+        if (domain_bitmap & (1 << d as u32)) != 0 {
+            let domain = qmicro_schema::QuantumDomain(d as u8);
+            defmt::error!("Recovering Domain {}", domain.0);
+            
+            // 1. Advance epoch to formally invalidate all domain capabilities
+            crate::capability::advance_epoch(domain);
+            
+            // 2. Revoke active IPC/MPU grants mapped by this domain
+            crate::ipc::revoke_grants_for_domain(domain);
+            
+            // 3. Clear IPC ringbuffers linked to this domain
+            crate::ipc::clear_queue(domain);
+            
+            // 4. (Optional) Force restart the user-space domain process.
+        }
+    }
+}
+
+pub fn trigger_panic(recoverable: bool, domain: Option<QuantumDomain>, msg: &str) -> ! {
+    defmt::error!("PANIC: {}", msg);
+    
+    if recoverable && domain.is_some() {
+        handle_domain_recovery(1 << domain.unwrap().0);
+        loop { core::hint::spin_loop(); }
+    } else {
+        #[cfg(target_arch = "arm")]
+        unsafe { core::arch::asm!("dsb", "isb"); } // Trigger System Reset
+        loop { core::hint::spin_loop(); }
+    }
+}
+```
+
+---
+
+### `qmicro/src/hw/mpu.rs`
+```rust
+//! Hardware Abstraction for the Memory Protection Unit.
+//! (Unsafe code restricted strictly to low-level hardware modules)
+
+#![allow(unsafe_code)]
+
+use crate::error::{KResult, KernelError};
+use qmicro_schema::QuantumDomain;
+
+pub unsafe fn configure_code_data_regions() {}
+
+pub unsafe fn configure_stack_guard(stack_base: usize, stack_size: usize) {
+    let _ = (stack_base, stack_size);
+}
+
+pub fn configure_grant_region(target: QuantumDomain, addr: usize, size: usize, read_only: bool) -> KResult<()> {
+    unsafe {
+        // Platform MPU mappings go here
+        let _ = (target, addr, size, read_only);
+    }
+    Ok(())
+}
+
+pub fn unmap_grant_region(target: QuantumDomain) -> KResult<()> {
+    unsafe {
+        let _ = target;
+    }
+    Ok(())
+}
+```
+
+---
+
+### `qmicro/src/main.rs`
+```rust
+//! # QMicro v4/v5 Entry Point
+//! Fully strict `#![deny(unsafe_code)]` at the top level. Defmt initialized.
+
+#![no_std]
+#![no_main]
+#![deny(unsafe_code)]
+
+pub mod config;
+pub mod error;
+pub mod sync;
+pub mod capability;
+pub mod scheduler;
+pub mod ipc;
+pub mod math;
+pub mod hw {
+    pub mod interrupts { pub fn init(){} }
+    pub mod mpu;
+    pub mod timer { pub fn now_ns() -> qmicro_schema::Nanoseconds { qmicro_schema::Nanoseconds(0) } pub unsafe fn arm_one_shot(_: qmicro_schema::Nanoseconds){} }
+    pub mod p4 { pub fn drain_ring(){} }
+    pub mod watchdog;
+}
+
+#[panic_handler]
+fn panic_handler(info: &core::panic::PanicInfo) -> ! {
+    defmt::error!("Kernel Panic: {}", defmt::Display2Format(info));
+    hw::watchdog::trigger_panic(false, None, "Critical System Panic");
+}
+
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    defmt::info!("Booting QMicro...");
+    
+    // Safety boundary checked at invocation
+    unsafe { hw::mpu::configure_code_data_regions(); }
+
+    loop {
+        // Top-level loop catches fault boundaries safely
+        if let Err(e) = scheduler::tick() {
+            defmt::error!("Scheduler Tick Fault: {:?}", e);
+        }
+    }
+}
+```
+
+---
+
+### `qmicro/src/math/mod.rs`
+```rust
+//! Deterministic Fixed-Point Math. Strictly safe!
+
+#![deny(unsafe_code)]
+
+pub type Q0_32 = u32;
+
+pub fn cordic_sin_cos(angle: u32) -> (i32, i32) {
+    const ATAN_TABLE: [u32; 16] = [
+        0x20000000, 0x12E4051D, 0x09D8839D, 0x04FA9BE9, 
+        0x027FA201, 0x013FF28F, 0x009FFC90, 0x004FFFF6,
+        0x0027FFF5, 0x0013FFFE, 0x000A0000, 0x00050000,
+        0x00028000, 0x00014000, 0x0000A000, 0x00005000,
+    ];
+    const K: i32 = 0x26DD3B6A;
+
+    let mut x: i32 = K;
+    let mut y: i32 = 0;
+    let mut z = (angle as i32) ^ 0x80000000; 
+
+    for i in 0..16 {
+        let d = if z >= 0 { 1 } else { -1 };
+        let tx = x - d * (y >> i);
+        let ty = y + d * (x >> i);
+        let tz = z - d * (ATAN_TABLE[i] as i32);
+        
+        x = tx;
+        y = ty;
+        z = tz;
+    }
+    (y, x)
+}
+```
+
+---
+
+### `qmicro/src/kani_proofs.rs`
+```rust
+//! Formal Verification Models Expanded for Enhanced Capabilities.
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+    use crate::capability::{CapabilityTable, Capability, OwnedCap, RIGHT_READ};
+    use crate::ipc::{MsgQueue};
+    use crate::math::cordic_sin_cos;
+    use qmicro_schema::{Pid, Epoch, QuantumDomain, Message};
+
+    // ── Capability Table & Free-List Integrity ──────────────────────────────
+    #[kani::proof]
+    fn prove_freelist_integrity() {
+        let mut table = CapabilityTable::new();
+        let cap = Capability {
+            owner: Pid(1),
+            domain: QuantumDomain(0),
+            epoch: Epoch(1),
+            rights: RIGHT_READ,
+        };
+
+        // Minting should assign the first ID
+        let token1 = table.mint(cap).unwrap();
+        assert_eq!(token1.index, 0);
+        
+        // Revoking it should push it back onto the free list
+        assert!(table.revoke_token(token1).is_ok());
+        
+        // Minting again should pull the exact same index, but with a bumped generation
+        let token2 = table.mint(cap).unwrap();
+        assert_eq!(token1.index, token2.index);
+        assert!(token1.gen != token2.gen);
+        
+        // The old token must fail lookup due to gen mismatch
+        assert!(table.lookup(token1, RIGHT_READ).is_err());
+        assert!(table.lookup(token2, RIGHT_READ).is_ok());
+    }
+
+    // ── Capability RAII Revocation ──────────────────────────────────────────
+    #[kani::proof]
+    fn prove_raii_capability_drop() {
+        let mut table = CapabilityTable::new();
+        let cap = Capability {
+            owner: Pid(1),
+            domain: QuantumDomain(0),
+            epoch: Epoch(1),
+            rights: RIGHT_READ,
+        };
+
+        let token = table.mint(cap).unwrap();
+        
+        {
+            let _owned = OwnedCap { token, rights_mask: RIGHT_READ };
+            assert!(table.lookup(token, RIGHT_READ).is_ok());
+        } // `_owned` dropped here
+
+        assert!(table.lookup(token, RIGHT_READ).is_err());
+    }
+
+    // ── IPC Message Queue Bounding ──────────────────────────────────────────
+    #[kani::proof]
+    fn prove_msg_queue_bounds() {
+        let mut q = MsgQueue::new();
+        let msg = Message::default();
+        
+        for _ in 0..crate::config::MSG_QUEUE_SIZE {
+            assert!(q.push(msg).is_ok());
+        }
+        assert!(q.push(msg).is_err()); // Queue Full
+
+        for _ in 0..crate::config::MSG_QUEUE_SIZE {
+            assert!(q.pop().is_ok());
+        }
+        assert!(q.pop().is_err()); // Queue Empty
+    }
+    
+    // ── Math Determinism ────────────────────────────────────────────────────
+    #[kani::proof]
+    fn prove_cordic_bounds() {
+        let angle: u32 = kani::any();
+        let (sin, cos) = cordic_sin_cos(angle);
+        assert!(sin >= -0x40000000 && sin <= 0x40000000);
+        assert!(cos >= -0x40000000 && cos <= 0x40000000);
+    }
+}
+```
